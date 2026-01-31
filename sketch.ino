@@ -490,9 +490,10 @@ static void showBootScreen() {
 static void* GIFOpenFile(const char* fname, int32_t* pSize) {
   if (!sdOK) return nullptr;
 
-  digitalWrite(TFT_CS, HIGH); // keep TFT off during SD
+  digitalWrite(TFT_CS, HIGH); // keep TFT off during SD activity
+
   File* pf = new File(SD.open(fname, FILE_READ));
-  if (!(*pf)) { delete pf; return nullptr; }
+  if (!pf || !(*pf)) { delete pf; return nullptr; }
 
   *pSize = (int32_t)pf->size();
   return (void*)pf;
@@ -1289,41 +1290,37 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     try {
       btnText.textContent = 'Fetching GIF…';
 
-      const r = await fetch(gifUrl, { mode:'cors' });
+      // Fetch with cache: 'no-store' to ensure we get fresh data
+      const r = await fetch(gifUrl, { cache: 'no-store' });
       if (!r.ok) throw new Error(`Fetch failed (${r.status})`);
+
       const blob = await r.blob();
 
-      // Hard sanity limit before processing (keeps phones from choking)
-      if (blob.size > 8 * 1024 * 1024) {
-        alert(`GIF is huge (${(blob.size/1024/1024).toFixed(1)}MB). Pick a smaller one.`);
-        return;
+      // Basic validation
+      const looksGif = (blob.type && blob.type.includes('gif')) || gifUrl.toLowerCase().includes('.gif');
+      if (!looksGif) throw new Error('Not a GIF (wrong format URL)');
+
+      // Device sanity limit
+      if (blob.size > 1200000) {
+        throw new Error(`GIF too big (${Math.round(blob.size/1024)}KB). Pick a smaller one.`);
       }
 
-      btnText.textContent = 'Fitting to 320×240…';
+      btnText.textContent = 'Uploading GIF…';
 
-      // This outputs a REAL GIF (not WebP), resized/cropped + infinite loop + optimized.
-      const outGifFile = await prepareGifForDevice(blob);
+      // Use original bytes directly to avoid re-encode issues
+      await uploadFileTo('/upload_gif', blob, 'latest.gif');
 
-      // Device limit (post-opt). Tune this.
-      if (outGifFile.size > 1200000) {
-        alert(`Still too big after optimize: ${(outGifFile.size/1024).toFixed(0)}KB. Pick a smaller GIF.`);
-        return;
-      }
-
-      btnText.textContent = 'Sending GIF…';
-
-      // Upload optimized GIF bytes
-      await uploadFileTo('/upload_gif', outGifFile, 'latest.gif');
-
-      // Start playback (loop param optional now because GIF itself loops, but keep it)
+      // Start device playback
       await fetch('/api/gif/play?loop=1', { method:'POST' });
 
       btnText.textContent = 'Playing!';
       setTimeout(() => { btnText.textContent = originalText; }, 1200);
+
     } catch(e) {
       console.error(e);
       btnText.textContent = 'GIF Failed';
       setTimeout(() => { btnText.textContent = originalText; }, 2000);
+      alert(e.message);
     } finally {
       sendBtn.classList.remove('sending');
       sendBtn.disabled = !hasImage;
@@ -1542,8 +1539,6 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         const previewUrl =
           (gif.images.fixed_width_small && gif.images.fixed_width_small.url) ||
           (gif.images.fixed_width && gif.images.fixed_width.url) ||
-          (gif.images.downsized_small && gif.images.downsized_small.url) ||
-          (gif.images.downsized && gif.images.downsized.url) ||
           (gif.images.preview_gif && gif.images.preview_gif.url) ||
           (gif.images.original && gif.images.original.url);
         im.src = previewUrl;
@@ -1551,12 +1546,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         div.appendChild(im);
 
         // Prefer smaller variants to avoid killing the ESP8266
-        // Priority: fixed_width_small (smallest) > fixed_width > downsized > original
+        // Use GIF-only variants (exclude MP4/downsized_small)
         const pick =
           (gif.images.fixed_width_small && gif.images.fixed_width_small.url) ||
           (gif.images.fixed_width && gif.images.fixed_width.url) ||
-          (gif.images.downsized_small && gif.images.downsized_small.url) ||
-          (gif.images.downsized && gif.images.downsized.url) ||
           (gif.images.preview_gif && gif.images.preview_gif.url) ||
           (gif.images.original && gif.images.original.url);
 
@@ -1864,9 +1857,8 @@ void setup() {
   sdOK = SD.begin(SD_CS);
   logf("[SD] begin=%s", sdOK ? "OK" : "FAIL");
 
-  // GIF decoder init (BIG/LITTLE endian selection depends on platform;
-  // on ESP8266 this setting is fine; palette values are used as uint16_t)
-  gif.begin(BIG_ENDIAN_PIXELS);
+  // GIF decoder init
+  gif.begin(LITTLE_ENDIAN_PIXELS);
 
   connectWiFi();
   showBootScreen();
