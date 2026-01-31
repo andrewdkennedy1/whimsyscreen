@@ -1142,69 +1142,133 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     return { w, h };
   }
 
-  let _gifsicle = null;
-  async function loadGifsicle() {
-    if (_gifsicle) return _gifsicle;
-    // CDN import (module). This is the simplest way; you already hit GIPHY on the public internet anyway.
-    const mod = await import('https://cdn.jsdelivr.net/npm/gifsicle-wasm-browser/dist/gifsicle.min.js');
-    _gifsicle = mod.default || mod;
-    return _gifsicle;
-  }
+  // --- Pure JS GIF processing (gifuct-js + gif.js)
+  // This avoids WASM/cropping issues by rendering to a 320x240 canvas directly.
+  
+  let _libsLoaded = false;
+  let _workerBlobUrl = null;
 
-  // --- True GIF processing using gifsicle (resize+crop+loop+optimize)
-  // Uses standard gifsicle flags: --resize and --crop x,y+WxH
-  // Works with gifsicle 1.92 (gifsicle-wasm-browser)
-  async function prepareGifForDevice(gifBlob) {
-    const ab = await gifBlob.arrayBuffer();
-    const { w, h } = readGifSize(ab);
-
-    const gifsicle = await loadGifsicle();
-
-    const dstW = 320, dstH = 240;
-
-    // "Cover" logic: scale to fill the screen
-    // We determine which dimension is the "limiter" to cover dimensions.
-    const sW = dstW / w;
-    const sH = dstH / h;
-    const s = Math.max(sW, sH);
-
-    // Gifsicle --resize WxH fits *inside* the box.
-    // To ensure coverage, we strictly constrain the dimension that matches 
-    // the max scale factor, and let the other dimension flow (using a large limit).
-    let resizeArg;
-    if (sW >= sH) {
-      // Width needs more scaling (or same) to cover. Force width=320.
-      resizeArg = `${dstW}x10000`;
-    } else {
-      // Height needs more scaling to cover. Force height=240.
-      resizeArg = `10000x${dstH}`;
+  async function loadGifLibs() {
+    if (_libsLoaded) return;
+    
+    // Load gifuct-js (decoder) - ESM version
+    if (!window.parseGIF) {
+      const mod = await import('https://esm.sh/gifuct-js@2.1.2');
+      window.parseGIF = mod.parseGIF;
+      window.decompressFrames = mod.decompressFrames;
     }
 
-    // Estimate precision dimensions for centering
-    // Note: Gifsicle's resizing should match the constrained dimension exactly.
-    const rw = Math.round(w * s);
-    const rh = Math.round(h * s);
+    // Load gif.js (encoder) - Script injection (legacy UMD)
+    if (!window.GIF) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.js';
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+    }
 
-    // Center crop rect
-    const cx = Math.max(0, Math.floor((rw - dstW) / 2));
-    const cy = Math.max(0, Math.floor((rh - dstH) / 2));
+    // Load worker script as Blob to bypass CORS
+    if (!_workerBlobUrl) {
+      const resp = await fetch('https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.worker.js');
+      const text = await resp.text();
+      const blob = new Blob([text], {type: 'application/javascript'});
+      _workerBlobUrl = URL.createObjectURL(blob);
+    }
 
-    const command = [`
-      --resize ${resizeArg}
-      --crop ${cx},${cy}+${dstW}x${dstH}
-      --loopcount=0
-      -O3
-      in.gif
-      -o /out/out.gif
-    `];
+    _libsLoaded = true;
+  }
 
-    const outFiles = await gifsicle.run({
-      input: [{ file: ab, name: "in.gif" }],
-      command,
-      isStrict: true
+  async function prepareGifForDevice(gifBlob) {
+    await loadGifLibs();
+    
+    const ab = await gifBlob.arrayBuffer();
+    const frames = window.decompressFrames(window.parseGIF(ab), true);
+
+    if (!frames || frames.length === 0) throw new Error("No frames");
+
+    // Dimensions of the original GIF
+    const w = frames[0].dims.width;
+    const h = frames[0].dims.height;
+
+    // Target
+    const dstW = 320;
+    const dstH = 240;
+
+    // Scratch canvas (full resolution state)
+    const scratch = document.createElement('canvas');
+    scratch.width = w; 
+    scratch.height = h;
+    const sctx = scratch.getContext('2d', { willReadFrequently: true });
+
+    // Output canvas (320x240)
+    const dest = document.createElement('canvas');
+    dest.width = dstW; 
+    dest.height = dstH;
+    const dctx = dest.getContext('2d');
+
+    // Setup Encoder
+    const encoder = new GIF({
+      workers: 2,
+      quality: 10,
+      width: dstW,
+      height: dstH,
+      workerScript: _workerBlobUrl
     });
 
-    return outFiles[0]; // /out/out.gif
+    // "Cover" scaling math
+    const sW = dstW / w;
+    const sH = dstH / h;
+    const scale = Math.max(sW, sH);
+    
+    // Calculate draw dimensions on dest
+    const dw = w * scale;
+    const dh = h * scale;
+    const dx = (dstW - dw) / 2;
+    const dy = (dstH - dh) / 2;
+
+    // Frame disposal tracking
+    let frameImageData = undefined; // currently displayed on scratch
+
+    // Render loop
+    for (let i = 0; i < frames.length; i++) {
+      const frame = frames[i];
+      const dims = frame.dims;
+
+      // Handle Disposal of PREVIOUS frame
+      // disposalType: 
+      // 1: Do not dispose (draw on top) - default
+      // 2: Restore to background (clear rect)
+      // 3: Restore to previous (not fully supported here easily, treating as 2 approx or 1)
+      if (i > 0) {
+        const prev = frames[i-1];
+        if (prev.disposalType === 2) {
+          sctx.clearRect(prev.dims.left, prev.dims.top, prev.dims.width, prev.dims.height);
+        }
+        // If 3, we'd need to restore saved state. Ignoring for now (rare in simple GIFs).
+      }
+
+      // Draw current frame patch
+      const patch = sctx.createImageData(dims.width, dims.height);
+      patch.data.set(frame.patch);
+      sctx.putImageData(patch, dims.left, dims.top);
+
+      // Compositing to Dest
+      dctx.fillStyle = 'black';
+      dctx.fillRect(0, 0, dstW, dstH);
+      dctx.drawImage(scratch, dx, dy, dw, dh);
+
+      // Add to encoder
+      encoder.addFrame(dest, { delay: frame.delay, copy: true });
+    }
+
+    return new Promise((resolve, reject) => {
+      encoder.on('finished', (blob) => {
+        resolve(blob);
+      });
+      encoder.render();
+    });
   }
 
   async function sendGIFUrlToDevice(gifUrl){
