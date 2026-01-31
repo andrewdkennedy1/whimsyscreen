@@ -601,6 +601,9 @@ static void GIFDraw(GIFDRAW* pDraw) {
   }
 
   tft.endWrite();
+
+  // IMPORTANT: keep ESP8266 watchdog happy during heavy GIF playback
+  yield();
 }
 
 // ===================== GIF control =====================
@@ -1149,46 +1152,59 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   }
 
   // --- True GIF processing using gifsicle (resize+crop+loop+optimize)
-  // Uses --resize-width or --resize-height based on aspect ratio, then --crop-center.
-  // This avoids manual crop math and is 100% portable across gifsicle builds.
+  // Uses standard gifsicle flags: --resize and --crop x,y+WxH
+  // Works with gifsicle 1.92 (gifsicle-wasm-browser)
   async function prepareGifForDevice(gifBlob) {
     const ab = await gifBlob.arrayBuffer();
     const { w, h } = readGifSize(ab);
 
     const gifsicle = await loadGifsicle();
 
-    // Decide scaling axis for "cover" behavior
-    const srcAspect = w / h;
-    const dstAspect = 320 / 240;
+    const dstW = 320, dstH = 240;
 
+    // "Cover" logic: scale to fill the screen
+    // We determine which dimension is the "limiter" to cover dimensions.
+    const sW = dstW / w;
+    const sH = dstH / h;
+    const s = Math.max(sW, sH);
+
+    // Gifsicle --resize WxH fits *inside* the box.
+    // To ensure coverage, we strictly constrain the dimension that matches 
+    // the max scale factor, and let the other dimension flow (using a large limit).
     let resizeArg;
-    if (srcAspect > dstAspect) {
-      // Source is wider → scale by height to fill vertically, then crop horizontally
-      resizeArg = '--resize-height 240';
+    if (sW >= sH) {
+      // Width needs more scaling (or same) to cover. Force width=320.
+      resizeArg = `${dstW}x10000`;
     } else {
-      // Source is taller → scale by width to fill horizontally, then crop vertically
-      resizeArg = '--resize-width 320';
+      // Height needs more scaling to cover. Force height=240.
+      resizeArg = `10000x${dstH}`;
     }
 
-    const cmd = [
-      `
-        ${resizeArg}
-        --crop-center 320x240
-        --loopcount=0
-        -O3
-        in.gif
-        -o /out/out.gif
-      `
-    ];
+    // Estimate precision dimensions for centering
+    // Note: Gifsicle's resizing should match the constrained dimension exactly.
+    const rw = Math.round(w * s);
+    const rh = Math.round(h * s);
+
+    // Center crop rect
+    const cx = Math.max(0, Math.floor((rw - dstW) / 2));
+    const cy = Math.max(0, Math.floor((rh - dstH) / 2));
+
+    const command = [`
+      --resize ${resizeArg}
+      --crop ${cx},${cy}+${dstW}x${dstH}
+      --loopcount=0
+      -O3
+      in.gif
+      -o /out/out.gif
+    `];
 
     const outFiles = await gifsicle.run({
       input: [{ file: ab, name: "in.gif" }],
-      command: cmd,
+      command,
       isStrict: true
     });
 
-    // outFiles are File objects; first is /out/out.gif
-    return outFiles[0];
+    return outFiles[0]; // /out/out.gif
   }
 
   async function sendGIFUrlToDevice(gifUrl){
@@ -1859,10 +1875,14 @@ void loop() {
       gifLastDelayMs = delayMs;
 
       if (!ok) {
-        // Finished (or error). If looping, reset instead of close+reopen.
+        // Finished (or error). If looping, close+reopen for stability across library versions.
         if (gifLoop) {
-          gif.reset();              // restart decode from frame 0
-          gifNextFrameMs = now;     // play immediately
+          gif.close();
+          gifPlaying = false;
+          if (!startGifPlayback(true)) {
+            stopGifPlayback();
+          }
+          gifNextFrameMs = now;
         } else {
           stopGifPlayback();
         }
