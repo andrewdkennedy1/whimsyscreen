@@ -1128,64 +1128,44 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     }
   }
 
-  // GIF compression: extract frames, resize to 320x240, re-encode with reduced quality
-  async function compressGIF(blob, maxWidth = 320, maxHeight = 240, maxFrames = 60) {
-    return new Promise((resolve, reject) => {
-      const url = URL.createObjectURL(blob);
-      const img = new Image();
-      img.onload = () => {
-        URL.revokeObjectURL(url);
-
-        // Create offscreen canvas for frame extraction
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
-
-        // Calculate scaled dimensions
-        const scale = Math.min(maxWidth / img.width, maxHeight / img.height, 1);
-        canvas.width = Math.round(img.width * scale);
-        canvas.height = Math.round(img.height * scale);
-
-        // For actual GIF encoding, we'll use a simple approach:
-        // If the original GIF is small enough, use it as-is
-        // Otherwise, we'll need to re-encode
-        const maxSize = 500 * 1024; // 500KB max after compression
-
-        if (blob.size <= maxSize && canvas.width >= img.width * 0.9) {
-          // GIF is already small enough, use as-is
-          resolve(blob);
-          return;
-        }
-
-        // Draw first frame to canvas
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-        // Try to get as WebP or fallback to JPEG for intermediate
-        canvas.toBlob((compressedBlob) => {
-          if (compressedBlob && compressedBlob.size < blob.size * 0.8) {
-            resolve(compressedBlob);
-          } else {
-            // Compression didn't help much, return original with warning
-            resolve(blob);
-          }
-        }, 'image/webp', 0.7);
-      };
-      img.onerror = () => {
-        URL.revokeObjectURL(url);
-        reject(new Error('Failed to load GIF for compression'));
-      };
-      img.src = url;
-    });
+  let _gifsicle = null;
+  async function loadGifsicle() {
+    if (_gifsicle) return _gifsicle;
+    // CDN import (module). This is the simplest way; you already hit GIPHY on the public internet anyway.
+    const mod = await import('https://cdn.jsdelivr.net/npm/gifsicle-wasm-browser/dist/gifsicle.min.js');
+    _gifsicle = mod.default || mod;
+    return _gifsicle;
   }
 
-  // Check if a GIF is suitable for the ESP8266
-  function validateGIFSize(size, maxBytes = 500000) {
-    if (size > maxBytes) {
-      return {
-        valid: false,
-        message: `GIF too large (${(size/1024).toFixed(1)}KB > ${(maxBytes/1024).toFixed(0)}KB). Try a smaller GIF.`
-      };
-    }
-    return { valid: true };
+  // --- True GIF processing using gifsicle (resize+crop+loop+optimize)
+  // Uses --resize-cover and --crop-center to avoid manual math/rounding errors.
+  async function prepareGifForDevice(gifBlob) {
+    const ab = await gifBlob.arrayBuffer();
+    const gifsicle = await loadGifsicle();
+
+    // --resize-cover: scales to fill 320x240 (aspect preserved, one dimension >= target)
+    // --crop-center: crops to exactly 320x240 from center (never exceeds bounds)
+    // --loopcount=0: infinite loop
+    // -O3: optimize for size
+    const cmd = [
+      `
+        --resize-cover 320x240
+        --crop-center 320x240
+        --loopcount=0
+        -O3
+        in.gif
+        -o /out/out.gif
+      `
+    ];
+
+    const outFiles = await gifsicle.run({
+      input: [{ file: ab, name: "in.gif" }],
+      command: cmd,
+      isStrict: true
+    });
+
+    // outFiles are File objects; first is /out/out.gif
+    return outFiles[0];
   }
 
   async function sendGIFUrlToDevice(gifUrl){
@@ -1193,60 +1173,48 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     sendBtn.disabled = true;
     const btnText = sendBtn.querySelector('.send-btn-text');
     const originalText = btnText.textContent;
-    btnText.textContent = 'Fetching GIF…';
 
     try {
-      // Fetch the actual GIF bytes
-      const r = await fetch(gifUrl, { mode:'cors' });
-      let blob = await r.blob();
+      btnText.textContent = 'Fetching GIF…';
 
-      // Validate size before upload
-      const validation = validateGIFSize(blob.size);
-      if (!validation.valid) {
-        btnText.textContent = 'GIF Too Large';
-        alert(validation.message);
+      const r = await fetch(gifUrl, { mode:'cors' });
+      if (!r.ok) throw new Error(`Fetch failed (${r.status})`);
+      const blob = await r.blob();
+
+      // Hard sanity limit before processing (keeps phones from choking)
+      if (blob.size > 8 * 1024 * 1024) {
+        alert(`GIF is huge (${(blob.size/1024/1024).toFixed(1)}MB). Pick a smaller one.`);
         return;
       }
 
-      btnText.textContent = 'Compressing…';
+      btnText.textContent = 'Fitting to 320×240…';
 
-      // Try to compress if needed
-      if (blob.size > 200000) { // Compress if > 200KB
-        try {
-          const compressed = await compressGIF(blob);
-          if (compressed.size < blob.size * 0.9) {
-            console.log(`GIF compressed: ${(blob.size/1024).toFixed(1)}KB → ${(compressed.size/1024).toFixed(1)}KB`);
-            blob = compressed;
-          }
-        } catch (e) {
-          console.warn('GIF compression failed, using original:', e);
-        }
-      }
+      // This outputs a REAL GIF (not WebP), resized/cropped + infinite loop + optimized.
+      const outGifFile = await prepareGifForDevice(blob);
 
-      // Final size check
-      const finalValidation = validateGIFSize(blob.size);
-      if (!finalValidation.valid) {
-        btnText.textContent = 'GIF Too Large';
-        alert(finalValidation.message);
+      // Device limit (post-opt). Tune this.
+      if (outGifFile.size > 1200000) {
+        alert(`Still too big after optimize: ${(outGifFile.size/1024).toFixed(0)}KB. Pick a smaller GIF.`);
         return;
       }
 
       btnText.textContent = 'Sending GIF…';
 
-      // Upload to /upload_gif
-      await uploadFileTo('/upload_gif', blob, 'latest.gif');
+      // Upload optimized GIF bytes
+      await uploadFileTo('/upload_gif', outGifFile, 'latest.gif');
 
-      // Start playback
+      // Start playback (loop param optional now because GIF itself loops, but keep it)
       await fetch('/api/gif/play?loop=1', { method:'POST' });
 
       btnText.textContent = 'Playing!';
       setTimeout(() => { btnText.textContent = originalText; }, 1200);
     } catch(e) {
+      console.error(e);
       btnText.textContent = 'GIF Failed';
       setTimeout(() => { btnText.textContent = originalText; }, 2000);
     } finally {
       sendBtn.classList.remove('sending');
-      sendBtn.disabled = !hasImage; // BMP send depends on photo presence
+      sendBtn.disabled = !hasImage;
       await fetchStatus();
     }
   }
@@ -1868,10 +1836,10 @@ void loop() {
       gifLastDelayMs = delayMs;
 
       if (!ok) {
-        logf("[GIF] finished/failed err=%d", gifLastError);
+        // Finished (or error). If looping, reset instead of close+reopen.
         if (gifLoop) {
-          gif.close();
-          startGifPlayback(true);
+          gif.reset();              // restart decode from frame 0
+          gifNextFrameMs = now;     // play immediately
         } else {
           stopGifPlayback();
         }
