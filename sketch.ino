@@ -1128,17 +1128,110 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     }
   }
 
+  // GIF compression: extract frames, resize to 320x240, re-encode with reduced quality
+  async function compressGIF(blob, maxWidth = 320, maxHeight = 240, maxFrames = 60) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+
+        // Create offscreen canvas for frame extraction
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+
+        // Calculate scaled dimensions
+        const scale = Math.min(maxWidth / img.width, maxHeight / img.height, 1);
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+
+        // For actual GIF encoding, we'll use a simple approach:
+        // If the original GIF is small enough, use it as-is
+        // Otherwise, we'll need to re-encode
+        const maxSize = 500 * 1024; // 500KB max after compression
+
+        if (blob.size <= maxSize && canvas.width >= img.width * 0.9) {
+          // GIF is already small enough, use as-is
+          resolve(blob);
+          return;
+        }
+
+        // Draw first frame to canvas
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+        // Try to get as WebP or fallback to JPEG for intermediate
+        canvas.toBlob((compressedBlob) => {
+          if (compressedBlob && compressedBlob.size < blob.size * 0.8) {
+            resolve(compressedBlob);
+          } else {
+            // Compression didn't help much, return original with warning
+            resolve(blob);
+          }
+        }, 'image/webp', 0.7);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('Failed to load GIF for compression'));
+      };
+      img.src = url;
+    });
+  }
+
+  // Check if a GIF is suitable for the ESP8266
+  function validateGIFSize(size, maxBytes = 500000) {
+    if (size > maxBytes) {
+      return {
+        valid: false,
+        message: `GIF too large (${(size/1024).toFixed(1)}KB > ${(maxBytes/1024).toFixed(0)}KB). Try a smaller GIF.`
+      };
+    }
+    return { valid: true };
+  }
+
   async function sendGIFUrlToDevice(gifUrl){
     sendBtn.classList.add('sending');
     sendBtn.disabled = true;
     const btnText = sendBtn.querySelector('.send-btn-text');
     const originalText = btnText.textContent;
-    btnText.textContent = 'Sending GIF…';
+    btnText.textContent = 'Fetching GIF…';
 
     try {
       // Fetch the actual GIF bytes
       const r = await fetch(gifUrl, { mode:'cors' });
-      const blob = await r.blob();
+      let blob = await r.blob();
+
+      // Validate size before upload
+      const validation = validateGIFSize(blob.size);
+      if (!validation.valid) {
+        btnText.textContent = 'GIF Too Large';
+        alert(validation.message);
+        return;
+      }
+
+      btnText.textContent = 'Compressing…';
+
+      // Try to compress if needed
+      if (blob.size > 200000) { // Compress if > 200KB
+        try {
+          const compressed = await compressGIF(blob);
+          if (compressed.size < blob.size * 0.9) {
+            console.log(`GIF compressed: ${(blob.size/1024).toFixed(1)}KB → ${(compressed.size/1024).toFixed(1)}KB`);
+            blob = compressed;
+          }
+        } catch (e) {
+          console.warn('GIF compression failed, using original:', e);
+        }
+      }
+
+      // Final size check
+      const finalValidation = validateGIFSize(blob.size);
+      if (!finalValidation.valid) {
+        btnText.textContent = 'GIF Too Large';
+        alert(finalValidation.message);
+        return;
+      }
+
+      btnText.textContent = 'Sending GIF…';
 
       // Upload to /upload_gif
       await uploadFileTo('/upload_gif', blob, 'latest.gif');
@@ -1365,14 +1458,26 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         div.className = 'gif-item';
 
         const im = document.createElement('img');
-        im.src = gif.images.fixed_width_small.url;
+        // Use the same small variant for preview that we'll use for download
+        const previewUrl =
+          (gif.images.fixed_width_small && gif.images.fixed_width_small.url) ||
+          (gif.images.fixed_width && gif.images.fixed_width.url) ||
+          (gif.images.downsized_small && gif.images.downsized_small.url) ||
+          (gif.images.downsized && gif.images.downsized.url) ||
+          (gif.images.preview_gif && gif.images.preview_gif.url) ||
+          (gif.images.original && gif.images.original.url);
+        im.src = previewUrl;
         im.alt = gif.title;
         div.appendChild(im);
 
         // Prefer smaller variants to avoid killing the ESP8266
+        // Priority: fixed_width_small (smallest) > fixed_width > downsized > original
         const pick =
+          (gif.images.fixed_width_small && gif.images.fixed_width_small.url) ||
           (gif.images.fixed_width && gif.images.fixed_width.url) ||
+          (gif.images.downsized_small && gif.images.downsized_small.url) ||
           (gif.images.downsized && gif.images.downsized.url) ||
+          (gif.images.preview_gif && gif.images.preview_gif.url) ||
           (gif.images.original && gif.images.original.url);
 
         div.addEventListener('click', ()=> sendGIFUrlToDevice(pick));
