@@ -60,7 +60,7 @@ static const uint32_t MAX_UPLOAD_BMP_BYTES = 450000;   // for 320x240 24bpp BMP
 static const uint32_t MAX_UPLOAD_GIF_BYTES = 1300000;  // keep sane for ESP8266
 
 // ILI9341 speed (tune down if wiring is marginal)
-static const uint32_t TFT_SPI_HZ = 40000000;           // 40MHz often OK on short wires
+static const uint32_t TFT_SPI_HZ = 27000000;           // 27MHz is more stable on most wiring
 
 // FeatherWing pins (ESP8266)
 #define TFT_CS     0
@@ -194,13 +194,16 @@ static void tftBannerError(const char* msg) {
   tft.print("Check Serial @115200");
 }
 
-// ===================== Safe BMP draw (fast-ish) =====================
+// ===================== Safe BMP draw (fast-ish, FIXED SPI arbitration) =====================
 // Supports 24-bit BI_RGB and 32-bit BI_RGB/BI_BITFIELDS
 static BmpResult drawBMPFromSD_Safe(const char* path) {
   if (!sdOK) {
     logf("[BMP] SD not OK");
     return BMP_OPEN_FAIL;
   }
+
+  // Stop GIF if playing, then draw BMP
+  stopGifPlayback();
 
   File bmp = SD.open(path, FILE_READ);
   if (!bmp) {
@@ -269,22 +272,19 @@ static BmpResult drawBMPFromSD_Safe(const char* path) {
   static uint16_t line565[320];
   static uint8_t  lineRaw[320 * 4];
 
-  // stop GIF if playing, then draw BMP
-  gifPlaying = false;
-  gif.close();
-
   tft.fillScreen(ILI9341_BLACK);
-  tft.startWrite();
 
   for (int16_t row = 0; row < drawH; row++) {
     yield();
+
+    // ---------- SD READ PHASE (TFT must be deselected) ----------
+    digitalWrite(TFT_CS, HIGH); // ensure TFT is not listening on SPI
 
     uint32_t srcRow = flip ? (uint32_t)(bmpH - 1 - row) : (uint32_t)row;
     uint32_t pos = pixelOffset + srcRow * rowSize;
 
     if (!bmp.seek(pos)) {
       logf("[BMP] seek failed row=%d pos=%lu", row, (unsigned long)pos);
-      tft.endWrite();
       bmp.close();
       return BMP_SEEK_FAIL;
     }
@@ -294,12 +294,11 @@ static BmpResult drawBMPFromSD_Safe(const char* path) {
     if (got != need) {
       logf("[BMP] short read row=%d need=%u got=%u pos=%lu",
            row, (unsigned)need, (unsigned)got, (unsigned long)pos);
-      tft.endWrite();
       bmp.close();
       return BMP_SHORT_READ;
     }
 
-    // BMP order: B,G,R,(A)
+    // Convert BMP order B,G,R,(A) -> RGB565
     for (int16_t x = 0; x < drawW; x++) {
       uint8_t b = lineRaw[x*bpp + 0];
       uint8_t g = lineRaw[x*bpp + 1];
@@ -307,11 +306,15 @@ static BmpResult drawBMPFromSD_Safe(const char* path) {
       line565[x] = tft.color565(r, g, b);
     }
 
+    // ---------- TFT WRITE PHASE (SD must be deselected) ----------
+    digitalWrite(SD_CS, HIGH); // make absolutely sure SD is idle
+
+    tft.startWrite();
     tft.setAddrWindow(0, row, drawW, 1);
     tft.writePixels(line565, (uint32_t)drawW, true /*block*/, false /*bigEndian*/);
+    tft.endWrite();
   }
 
-  tft.endWrite();
   bmp.close();
   logf("[BMP] draw OK");
   return BMP_OK;
@@ -487,28 +490,18 @@ static void showBootScreen() {
 static void* GIFOpenFile(const char* fname, int32_t* pSize) {
   if (!sdOK) return nullptr;
 
-  // Ensure TFT CS is inactive before SD ops
-  digitalWrite(TFT_CS, HIGH);
+  digitalWrite(TFT_CS, HIGH); // keep TFT off during SD
+  File* pf = new File(SD.open(fname, FILE_READ));
+  if (!(*pf)) { delete pf; return nullptr; }
 
-  File f = SD.open(fname, FILE_READ);
-  if (!f) return nullptr;
-
-  *pSize = (int32_t)f.size();
-
-  // AnimatedGIF expects a persistent handle. We'll heap-allocate a File object.
-  File* pf = new File(f);
+  *pSize = (int32_t)pf->size();
   return (void*)pf;
 }
 
 static void GIFCloseFile(void* pHandle) {
   if (!pHandle) return;
   File* pf = (File*)pHandle;
-  if (pf->available()) {
-    pf->close();
-  } else {
-    // still close if open
-    pf->close();
-  }
+  pf->close();
   delete pf;
 }
 
@@ -1069,41 +1062,40 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     return buf;
   }
 
-  function uploadFileTo(endpoint, blob, filename){
+  function uploadFileTo(endpoint, blob, filename) {
     const fd = new FormData();
+    // Use 'image' field name for consistency with server handlers
     fd.append('image', blob, filename);
 
-    return new Promise((resolve,reject)=>{
+    return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('POST', endpoint, true);
 
-      xhr.upload.onprogress = (e)=>{
+      xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) {
-          const pct = Math.round((e.loaded/e.total)*100);
+          const pct = Math.round((e.loaded / e.total) * 100);
           sendProgress.style.width = pct + '%';
         }
       };
-      xhr.onload = ()=>{
-        sendProgress.style.width = '0%';
+      xhr.onload = () => {
         if (xhr.status === 200) resolve(xhr.responseText);
-        else reject(new Error(xhr.responseText || ('HTTP ' + xhr.status)));
+        else reject(new Error('HTTP ' + xhr.status));
       };
-      xhr.onerror = ()=>{
-        sendProgress.style.width = '0%';
-        reject(new Error('network error'));
+      xhr.onerror = () => {
+        reject(new Error('Network error'));
       };
       xhr.send(fd);
     });
   }
 
-  async function sendBMP(){
+  async function sendBMP() {
     if (!hasImage) return;
 
     sendBtn.classList.add('sending');
     sendBtn.disabled = true;
     const btnText = sendBtn.querySelector('.send-btn-text');
     const originalText = btnText.textContent;
-    btnText.textContent = 'Sending BMP…';
+    btnText.textContent = 'Processing…';
 
     try {
       const work = document.createElement('canvas');
@@ -1115,15 +1107,25 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 
       const bmp = makeBMP24(work);
       const blob = new Blob([bmp], {type:'image/bmp'});
+      
+      btnText.textContent = 'Uploading…';
       await uploadFileTo('/upload', blob, 'latest.bmp');
 
+      btnText.textContent = 'Drawing…';
       await fetch('/api/draw', { method:'POST' });
 
       btnText.textContent = 'Sent!';
-      setTimeout(() => { btnText.textContent = originalText; }, 1200);
+      setTimeout(() => { 
+        btnText.textContent = originalText;
+        sendProgress.style.width = '0%';
+      }, 1500);
     } catch(e) {
+      console.error("Upload failed", e);
       btnText.textContent = 'Failed';
-      setTimeout(() => { btnText.textContent = originalText; }, 2000);
+      setTimeout(() => { 
+        btnText.textContent = originalText;
+        sendProgress.style.width = '0%';
+      }, 2000);
     } finally {
       sendBtn.classList.remove('sending');
       await fetchStatus();
@@ -1208,13 +1210,14 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     dest.height = dstH;
     const dctx = dest.getContext('2d');
 
-    // Setup Encoder
+    // Setup Encoder with high quality and dither for better results
     const encoder = new GIF({
       workers: 2,
-      quality: 10,
+      quality: 1, // 1 is best, 10 is default
       width: dstW,
       height: dstH,
-      workerScript: _workerBlobUrl
+      workerScript: _workerBlobUrl,
+      dither: 'FloydSteinberg'
     });
 
     // "Cover" scaling math
@@ -1227,6 +1230,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     const dh = h * scale;
     const dx = (dstW - dw) / 2;
     const dy = (dstH - dh) / 2;
+
+    // Fill background for transparency handling
+    sctx.fillStyle = 'black';
+    sctx.fillRect(0, 0, w, h);
 
     // Frame disposal tracking
     let frameImageData = undefined; // currently displayed on scratch
@@ -1260,7 +1267,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       dctx.drawImage(scratch, dx, dy, dw, dh);
 
       // Add to encoder
-      encoder.addFrame(dest, { delay: frame.delay, copy: true });
+      // gifuct-js delay is in centiseconds (1/100s), gif.js expects milliseconds
+      // We also ensure a minimum delay for playback stability on-device.
+      encoder.addFrame(dest, { delay: Math.max(frame.delay * 10, 20), copy: true });
     }
 
     return new Promise((resolve, reject) => {
