@@ -1128,6 +1128,17 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     }
   }
 
+  // --- GIF: read dimensions from header (no decode needed)
+  function readGifSize(arrayBuffer) {
+    const u8 = new Uint8Array(arrayBuffer);
+    if (u8.length < 10) throw new Error("Not a GIF");
+    if (String.fromCharCode(u8[0],u8[1],u8[2]) !== "GIF")
+      throw new Error("Not a GIF");
+    const w = u8[6] | (u8[7] << 8);
+    const h = u8[8] | (u8[9] << 8);
+    return { w, h };
+  }
+
   let _gifsicle = null;
   async function loadGifsicle() {
     if (_gifsicle) return _gifsicle;
@@ -1138,18 +1149,30 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   }
 
   // --- True GIF processing using gifsicle (resize+crop+loop+optimize)
-  // Uses --resize-cover and --crop-center to avoid manual math/rounding errors.
+  // Uses --resize-width or --resize-height based on aspect ratio, then --crop-center.
+  // This avoids manual crop math and is 100% portable across gifsicle builds.
   async function prepareGifForDevice(gifBlob) {
     const ab = await gifBlob.arrayBuffer();
+    const { w, h } = readGifSize(ab);
+
     const gifsicle = await loadGifsicle();
 
-    // --resize-cover: scales to fill 320x240 (aspect preserved, one dimension >= target)
-    // --crop-center: crops to exactly 320x240 from center (never exceeds bounds)
-    // --loopcount=0: infinite loop
-    // -O3: optimize for size
+    // Decide scaling axis for "cover" behavior
+    const srcAspect = w / h;
+    const dstAspect = 320 / 240;
+
+    let resizeArg;
+    if (srcAspect > dstAspect) {
+      // Source is wider → scale by height to fill vertically, then crop horizontally
+      resizeArg = '--resize-height 240';
+    } else {
+      // Source is taller → scale by width to fill horizontally, then crop vertically
+      resizeArg = '--resize-width 320';
+    }
+
     const cmd = [
       `
-        --resize-cover 320x240
+        ${resizeArg}
         --crop-center 320x240
         --loopcount=0
         -O3
